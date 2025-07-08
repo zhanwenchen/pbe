@@ -1,302 +1,365 @@
+#!/usr/bin/env python
+# coding: utf-8
+"""
+main.py  ──  Lightning-free rewrite that follows the original coding style.
+"""
+
+# -------------------------------------------------------------------------
+# stdlib
+# -------------------------------------------------------------------------
 from argparse import ArgumentParser, ArgumentTypeError, Namespace
 from functools import partial
-import os
-import sys
 import datetime
 import glob
+import os
+import sys
 from pprint import pprint
-from numpy.random import seed as np_random_seed, get_state as np_random_get_state, choice as np_random_choice
-import pytorch_lightning as pl
-from omegaconf import OmegaConf
-from pytorch_lightning import seed_everything
-from pytorch_lightning.trainer import Trainer
-from torch import set_float32_matmul_precision
+
+# -------------------------------------------------------------------------
+# third-party
+# -------------------------------------------------------------------------
 import torch
+from torch import set_float32_matmul_precision
 from torch.utils.data import DataLoader, Dataset, get_worker_info
-from lightning.pytorch.accelerators import find_usable_cuda_devices
+
+from numpy.random import (
+    seed     as np_random_seed,
+    get_state as np_random_get_state,
+    choice   as np_random_choice,
+)
+
+from omegaconf import OmegaConf
+
+from accelerate import Accelerator, DistributedDataParallelKwargs
+from accelerate.utils import DeepSpeedPlugin
+from transformers import AdamW, get_cosine_schedule_with_warmup, set_seed
+
+# -------------------------------------------------------------------------
+# project
+# -------------------------------------------------------------------------
 from ldm.data.base import Txt2ImgIterableBaseDataset
 from ldm.util import instantiate_from_config
 
 
-NUM_WORKERS = 11 # 11, 0 for debug
-PERSISTENT_WORKERS = True if NUM_WORKERS > 0 else False
+# -------------------------------------------------------------------------
+# constants & misc
+# -------------------------------------------------------------------------
+NUM_WORKERS         = 11        # 0 ⇒ single-process dataloading
+PERSISTENT_WORKERS  = NUM_WORKERS > 0
+
+set_float32_matmul_precision("high")
 
 
-set_float32_matmul_precision('high')
+# -------------------------------------------------------------------------
+# helpers
+# -------------------------------------------------------------------------
+def str2bool(v: str | bool) -> bool:
+    if isinstance(v, bool):
+        return v
+    v = v.lower()
+    if v in {"yes", "true", "t", "y", "1"}:
+        return True
+    if v in {"no", "false", "f", "n", "0"}:
+        return False
+    raise ArgumentTypeError(f"Boolean value expected. {v=}")
 
 
-def get_parser(**parser_kwargs):
-    def str2bool(v):
-        if isinstance(v, bool):
-            return v
-        if (v:= v.lower()) in ("yes", "true", "t", "y", "1"):
-            return True
-        if v in {"no", "false", "f", "n", "0"}:
-            return False
-        raise ArgumentTypeError(f"Boolean value expected. {v=}")
+def worker_init_fn(_: int) -> None:
+    """
+    Provides worker-specific seeding and iterable-dataset sharding.
+    Mirrors original behaviour that relied on numpy RNG-state.
+    """
+    w_info   = get_worker_info()
+    worker_id = w_info.id
+    dataset  = w_info.dataset
 
-    parser = ArgumentParser(**parser_kwargs)
-    parser.add_argument("-n", "--name", type=str, const=True, default="", nargs="?", help="postfix for logdir")
-    parser.add_argument("-r", "--resume", type=str, const=True, default="", nargs="?", help="resume from logdir or checkpoint in logdir")
-    parser.add_argument("-b", "--base", nargs="*", metavar="base_config.yaml", help="paths to base configs. Loaded from left-to-right. " "Parameters can be overwritten or added with command-line options of the form `--key value`.", default=["configs/stable-diffusion/v1-inference-inpaint.yaml"],)
-    parser.add_argument("-t", "--train", type=str2bool, const=True, default=True, nargs="?", help="train")
-    parser.add_argument("--no-test", type=str2bool, const=True, default=False, nargs="?", help="disable test")
-    parser.add_argument("-p", "--project", help="name of new or path to existing project")
-    parser.add_argument("-d", "--debug", type=str2bool, nargs="?", const=True, default=False, help="enable post-mortem debugging")
-    parser.add_argument("-s", "--seed", type=int, default=23, help="seed for seed_everything")
-    parser.add_argument("-f", "--postfix", type=str, default="", help="post-postfix for default name")
-    parser.add_argument("-l", "--logdir", type=str, default="logs", help="directory for logging dat shit")
-    parser.add_argument("--pretrained_model", type=str, default="", help="path to pretrained model")
-    parser.add_argument("--scale_lr", type=str2bool, nargs="?", const=True, default=True, help="scale base-lr by ngpu * batch_size * n_accumulate")
-    parser.add_argument("--train_from_scratch", type=str2bool, nargs="?", const=True, default=False, help="Train from scratch")
-    return parser
+    rng_state = np_random_get_state()[1]
+    if isinstance(dataset, Txt2ImgIterableBaseDataset):
+        split = dataset.num_records // w_info.num_workers
+        dataset.sample_ids = dataset.valid_ids[worker_id * split:(worker_id + 1) * split]
+        current_idx = np_random_choice(len(rng_state), 1)
+        seed = rng_state[current_idx] + worker_id
+    else:
+        seed = rng_state[0] + worker_id
 
-
-def nondefault_trainer_args(opt):
-    parser = ArgumentParser()
-    # parser = Trainer.add_argparse_args(parser)
-    args = parser.parse_args([])
-    return sorted(k for k in vars(args) if getattr(opt, k) != getattr(args, k))
+    np_random_seed(seed)
 
 
 class WrappedDataset(Dataset):
-    """Wraps an arbitrary object with __len__ and __getitem__ into a pytorch dataset"""
-
-    def __init__(self, dataset):
-        self.data = dataset
-
-    def __len__(self):
-        return len(self.data)
-
-    def __getitem__(self, idx):
-        return self.data[idx]
+    """Wrap any iterable/sequence to satisfy PyTorch Dataset API."""
+    def __init__(self, data): self.data = data
+    def __len__(self):        return len(self.data)
+    def __getitem__(self, i): return self.data[i]
 
 
-def worker_init_fn(_):
-    worker_info = get_worker_info()
+# -------------------------------------------------------------------------
+# DataModule analogue  (drop-in for the former Lightning one)
+# -------------------------------------------------------------------------
+class DataModuleFromConfig:
+    """
+    Same public surface as the original LightningDataModule variant, minus
+    the inheritance. Keeping the original method names so configs need
+    **zero** changes.
+    """
 
-    dataset = worker_info.dataset
-    worker_id = worker_info.id
+    def __init__(
+        self,
+        batch_size,
+        train=None,
+        validation=None,
+        test=None,
+        predict=None,
+        wrap=False,
+        num_workers=None,
+        shuffle_test_loader=False,
+        use_worker_init_fn=False,
+        shuffle_val_dataloader=False,
+    ):
+        self.batch_size            = batch_size
+        self.wrap                  = wrap
+        self.num_workers           = NUM_WORKERS if num_workers is None else num_workers
+        self.use_worker_init_fn    = use_worker_init_fn
+        self.shuffle_test_loader   = shuffle_test_loader
+        self.shuffle_val_dataloader= shuffle_val_dataloader
 
-    if isinstance(dataset, Txt2ImgIterableBaseDataset):
-        split_size = dataset.num_records // worker_info.num_workers
-        # reset num_records to the true number to retain reliable length information
-        dataset.sample_ids = dataset.valid_ids[worker_id * split_size:(worker_id + 1) * split_size]
-        current_id = np_random_choice(len(np_random_get_state()[1]), 1)
-        return np_random_seed(np_random_get_state()[1][current_id] + worker_id)
-    return np_random_seed(np_random_get_state()[1][0] + worker_id)
-
-
-class DataModuleFromConfig(pl.LightningDataModule):
-    def __init__(self, batch_size, train=None, validation=None, test=None, predict=None,
-                 wrap=False, num_workers=None, shuffle_test_loader=False, use_worker_init_fn=False,
-                 shuffle_val_dataloader=False):
-        super().__init__()
-        self.batch_size = batch_size
-        self.dataset_configs = {}
-        num_workers = NUM_WORKERS
-        self.num_workers = num_workers if num_workers is not None else batch_size * 2
-        self.use_worker_init_fn = use_worker_init_fn
-        if train is not None:
-            self.dataset_configs["train"] = train
-            self.train_dataloader = self._train_dataloader
-        if validation is not None:
-            self.dataset_configs["validation"] = validation
-            self.val_dataloader = partial(self._val_dataloader, shuffle=shuffle_val_dataloader)
-        if test is not None:
-            self.dataset_configs["test"] = test
-            self.test_dataloader = partial(self._test_dataloader, shuffle=shuffle_test_loader)
-        if predict is not None:
-            self.dataset_configs["predict"] = predict
-            self.predict_dataloader = self._predict_dataloader
-        self.wrap = wrap
+        self.dataset_configs = {
+            k: v
+            for k, v in zip(
+                ("train", "validation", "test", "predict"),
+                (train, validation, test, predict),
+            ) if v is not None
+        }
         self.datasets = {}
 
+        # preserve original API surface
+        if "train" in self.dataset_configs:
+            self.train_dataloader   = self._train_dataloader
+        if "validation" in self.dataset_configs:
+            self.val_dataloader     = self._val_dataloader
+        if "test" in self.dataset_configs:
+            self.test_dataloader    = self._test_dataloader
+        if "predict" in self.dataset_configs:
+            self.predict_dataloader = self._predict_dataloader
+
+    # ----- lightning-compat stubs -------------------------------------
     def prepare_data(self):
-        for data_cfg in self.dataset_configs.values():
-            instantiate_from_config(data_cfg)
+        for cfg in self.dataset_configs.values():
+            instantiate_from_config(cfg)
 
     def setup(self, stage=None):
-        self.datasets = dict(
-            (k, instantiate_from_config(self.dataset_configs[k]))
-            for k in self.dataset_configs)
+        self.datasets = {
+            k: instantiate_from_config(cfg) for k, cfg in self.dataset_configs.items()
+        }
         if self.wrap:
-            for k in self.datasets:
-                self.datasets[k] = WrappedDataset(self.datasets[k])
+            self.datasets = {k: WrappedDataset(v) for k, v in self.datasets.items()}
 
-    def _train_dataloader(self):
-        is_iterable_dataset = isinstance(self.datasets['train'], Txt2ImgIterableBaseDataset)
-        if is_iterable_dataset or self.use_worker_init_fn:
-            init_fn = worker_init_fn
-        else:
-            init_fn = None
-        return DataLoader(self.datasets["train"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, shuffle=False if is_iterable_dataset else True,
-                          worker_init_fn=init_fn, persistent_workers=PERSISTENT_WORKERS)
-
-    def _val_dataloader(self, shuffle=False):
-        if isinstance(self.datasets['validation'], Txt2ImgIterableBaseDataset) or self.use_worker_init_fn:
-            init_fn = worker_init_fn
-        else:
-            init_fn = None
-        return DataLoader(self.datasets["validation"],
-                          batch_size=self.batch_size,
-                          num_workers=self.num_workers,
-                          worker_init_fn=init_fn,
-                          shuffle=shuffle, persistent_workers=PERSISTENT_WORKERS)
-
-    def _test_dataloader(self, shuffle=False):
-        is_iterable_dataset = isinstance(self.datasets['train'], Txt2ImgIterableBaseDataset)
-        if is_iterable_dataset or self.use_worker_init_fn:
-            init_fn = worker_init_fn
-        else:
-            init_fn = None
-
-        # do not shuffle dataloader for iterable dataset
-        shuffle = shuffle and (not is_iterable_dataset)
-
-        return DataLoader(self.datasets["test"], batch_size=self.batch_size,
-                          num_workers=self.num_workers, worker_init_fn=init_fn, shuffle=shuffle, persistent_workers=PERSISTENT_WORKERS)
-
-    def _predict_dataloader(self, shuffle=False):
-        predict = self.datasets['predict']
-        if isinstance(predict, Txt2ImgIterableBaseDataset) or self.use_worker_init_fn:
-            init_fn = worker_init_fn
-        else:
-            init_fn = None
-        return DataLoader(predict, batch_size=self.batch_size,
-                          num_workers=self.num_workers, worker_init_fn=init_fn, persistent_workers=PERSISTENT_WORKERS,)
-
-
-if __name__ == "__main__":
-    now = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
-    sys.path.append(os.getcwd())
-
-    parser = get_parser()
-    args = parser.parse_args()
-
-    opt, unknown = parser.parse_known_args()
-    if opt.name and opt.resume:
-        raise ValueError(
-            "-n/--name and -r/--resume cannot be specified both."
-            "If you want to resume training in a new log folder, "
-            "use -n/--name in combination with --resume_from_checkpoint"
+    # ----- internal loader builders -----------------------------------
+    def _make_loader(self, name: str, shuffle: bool):
+        ds           = self.datasets[name]
+        iterable     = isinstance(ds, Txt2ImgIterableBaseDataset)
+        init_fn      = worker_init_fn if (iterable or self.use_worker_init_fn) else None
+        should_shuffle = shuffle and not iterable
+        return DataLoader(
+            ds,
+            batch_size         = self.batch_size,
+            shuffle            = should_shuffle,
+            num_workers        = self.num_workers,
+            worker_init_fn     = init_fn,
+            persistent_workers = PERSISTENT_WORKERS,
+            pin_memory         = True,
         )
+
+    # public shortcuts
+    def _train_dataloader  (self): return self._make_loader("train",        shuffle=True)
+    def _val_dataloader    (self): return self._make_loader("validation",   shuffle=self.shuffle_val_dataloader)
+    def _test_dataloader   (self): return self._make_loader("test",         shuffle=self.shuffle_test_loader)
+    def _predict_dataloader(self): return self._make_loader("predict",      shuffle=False)
+
+
+# -------------------------------------------------------------------------
+# CLI
+# -------------------------------------------------------------------------
+def get_parser(**kwargs):
+    parser = ArgumentParser(**kwargs)
+    parser.add_argument("-n", "--name",    type=str, nargs="?", const=True, default="")
+    parser.add_argument("-r", "--resume",  type=str, nargs="?", const=True, default="")
+    parser.add_argument("-b", "--base",    nargs="*", default=["configs/stable-diffusion/v1-inference-inpaint.yaml"],
+                        metavar="base_config.yaml")
+    parser.add_argument("-t", "--train",   type=str2bool, nargs="?", const=True, default=True)
+    parser.add_argument("--no-test",       type=str2bool, nargs="?", const=True, default=False)
+    parser.add_argument("-p", "--project")
+    parser.add_argument("-d", "--debug",   type=str2bool, nargs="?", const=True, default=False)
+    parser.add_argument("-s", "--seed",    type=int, default=23)
+    parser.add_argument("-f", "--postfix", type=str, default="")
+    parser.add_argument("-l", "--logdir",  type=str, default="logs")
+    parser.add_argument("--pretrained_model",      type=str, default="")
+    parser.add_argument("--scale_lr",              type=str2bool, nargs="?", const=True, default=True)
+    parser.add_argument("--train_from_scratch",    type=str2bool, nargs="?", const=True, default=False)
+    return parser
+
+
+# -------------------------------------------------------------------------
+# log/ckpt dir handling  (mirrors original logic)
+# -------------------------------------------------------------------------
+def prepare_log_dirs(opt: Namespace, run_stamp: str):
+    if opt.name and opt.resume:
+        raise ValueError("Specify only one of --name or --resume, not both.")
+
     if opt.resume:
         if not os.path.exists(opt.resume):
-            raise ValueError(f'Cannot find {opt.resume}')
-        if os.path.isfile(opt.resume):
-            paths = opt.resume.split("/")
-            # idx = len(paths)-paths[::-1].index("logs")+1
-            # logdir = "/".join(paths[:idx])
-            logdir = "/".join(paths[:-2])
-            ckpt = opt.resume
-        else:
-            assert os.path.isdir(opt.resume), opt.resume
-            logdir = opt.resume.rstrip("/")
-            ckpt = os.path.join(logdir, "checkpoints", "last.ckpt")
+            raise ValueError(f"Cannot find {opt.resume}")
 
+        if os.path.isfile(opt.resume):
+            logdir = "/".join(opt.resume.split("/")[:-2])
+            ckpt   = opt.resume
+        else:
+            logdir = opt.resume.rstrip("/")
+            ckpt   = os.path.join(logdir, "checkpoints", "last.ckpt")
         opt.resume_from_checkpoint = ckpt
-        base_configs = sorted(glob.glob(os.path.join(logdir, "configs/*.yaml")))
-        opt.base = base_configs + opt.base
-        _tmp = logdir.split("/")
-        nowname = _tmp[-1]
+        opt.base = sorted(glob.glob(os.path.join(logdir, "configs/*.yaml"))) + opt.base
+        run_name = os.path.basename(logdir)
     else:
         if opt.name:
-            name = "_" + opt.name
+            suffix = "_" + opt.name
         elif opt.base:
-            cfg_fname = os.path.split(opt.base[0])[-1]
-            cfg_name = os.path.splitext(cfg_fname)[0]
-            name = "_" + cfg_name
+            suffix = "_" + os.path.splitext(os.path.basename(opt.base[0]))[0]
         else:
-            name = ""
-        nowname = now + name + opt.postfix
-        logdir = os.path.join(opt.logdir, nowname)
+            suffix = ""
+        run_name = f"{run_stamp}{suffix}{opt.postfix}"
+        logdir   = os.path.join(opt.logdir, run_name)
 
     ckptdir = os.path.join(logdir, "checkpoints")
-    cfgdir = os.path.join(logdir, "configs")
-    seed_everything(opt.seed)
+    cfgdir  = os.path.join(logdir, "configs")
+    os.makedirs(ckptdir, exist_ok=True)
+    os.makedirs(cfgdir,  exist_ok=True)
+    return logdir, ckptdir, cfgdir
 
-    # try:
-        # init and save configs
-    configs = [OmegaConf.load(cfg) for cfg in opt.base]
-    cli = OmegaConf.from_dotlist(unknown)
-    config = OmegaConf.merge(*configs, cli)
-    lightning_config = config.pop("lightning", OmegaConf.create())
-    # merge trainer cli with config
-    trainer_config = lightning_config.get("trainer", OmegaConf.create())
-    # default to ddp
-    trainer_config["accelerator"] = "ddp"
-    for k in nondefault_trainer_args(opt):
-        trainer_config[k] = getattr(opt, k)
-    if not "gpus" in trainer_config:
-        del trainer_config["accelerator"]
-        cpu = True
-    else:
-        gpuinfo = trainer_config["gpus"]
-        print(f"Running on GPUs {gpuinfo}")
-        cpu = False
-    trainer_opt = Namespace(**trainer_config)
-    lightning_config.trainer = trainer_config
 
-    # model
-    model = instantiate_from_config(config.model)
-    # model = torch_compile(model)
+# -------------------------------------------------------------------------
+# main
+# -------------------------------------------------------------------------
+def main():
+    run_stamp = datetime.datetime.now().strftime("%Y%m%dT%H%M%S")
+    sys.path.append(os.getcwd())
+
+    # ----- parse ----------------------------------------------------------------
+    parser = get_parser()
+    opt, unknown = parser.parse_known_args()
+
+    # ----- config merge ---------------------------------------------------------
+    cfg_files = [OmegaConf.load(p) for p in opt.base]
+    cli_cfg   = OmegaConf.from_dotlist(unknown)
+    cfg       = OmegaConf.merge(*cfg_files, cli_cfg)
+
+    logdir, ckptdir, _ = prepare_log_dirs(opt, run_stamp)
+
+    # ----- seeding --------------------------------------------------------------
+    set_seed(opt.seed)
+
+    # ----- model ----------------------------------------------------------------
+    model = instantiate_from_config(cfg.model)
+
     if not opt.resume:
+        sd = torch.load(opt.pretrained_model, map_location="cpu", weights_only=False)["state_dict"]
         if opt.train_from_scratch:
-            ckpt_file=torch.load(opt.pretrained_model, map_location='cpu', weights_only=False)['state_dict']
-            ckpt_file={key:value for key,value in ckpt_file.items() if not key[:6]=='model.'}
-            model.load_state_dict(ckpt_file,strict=False)
-            print("Train from scratch!")
+            sd = {k[len("model."):]: v for k, v in sd.items() if k.startswith("model.")}
+            print("Train from scratch -> loading non-textual weights only.")
         else:
-            model.load_state_dict(torch.load(opt.pretrained_model, map_location='cpu', weights_only=False)['state_dict'], strict=False)
-            print("Load Stable Diffusion v1-4!")
+            print("Loading Stable Diffusion v1-4 weights.")
+        model.load_state_dict(sd, strict=False)
 
-    # trainer and callbacks
-    trainer_kwargs = {}
-
-    args_trainer_dict = vars(trainer_opt) | trainer_kwargs
-    args_trainer_dict.pop('gpus')
-    # print(f'{args_trainer_dict["accelerator"]=}, {gpus=}')
-    args_trainer_dict['accelerator'] = 'cuda'
-    devices = find_usable_cuda_devices()
-    pprint(args_trainer_dict)
-    trainer = Trainer(**args_trainer_dict, devices=devices, strategy='deepspeed_stage_2', default_root_dir=ckptdir)
-
-    trainer.logdir = logdir  ###
-
-    # data
-    data = instantiate_from_config(config.data)
-    # NOTE according to https://pytorch-lightning.readthedocs.io/en/latest/datamodules.html
-    # calling these ourselves should not be necessary but it is.
-    # lightning still takes care of proper multiprocessing though
+    # ----- data -----------------------------------------------------------------
+    data: DataModuleFromConfig = instantiate_from_config(cfg.data)
     data.prepare_data()
     data.setup()
-    print("#### Data #####")
-    for k in data.datasets:
-        print(f"{k}, {data.datasets[k].__class__.__name__}, {len(data.datasets[k])}")
 
-    # configure learning rate
-    bs, base_lr = config.data.params.batch_size, config.model.base_learning_rate
-    if not cpu:
-        ngpu = len(lightning_config.trainer.gpus.strip(",").split(','))
-    else:
-        ngpu = 1
-    if 'accumulate_grad_batches' in lightning_config.trainer:
-        accumulate_grad_batches = lightning_config.trainer.accumulate_grad_batches
-    else:
-        accumulate_grad_batches = 1
-    num_nodes = 1
-    print(f"accumulate_grad_batches = {accumulate_grad_batches}")
-    lightning_config.trainer.accumulate_grad_batches = accumulate_grad_batches
+    train_loader = data.train_dataloader()
+    val_loader   = None if opt.no_test else data.val_dataloader()
+    test_loader  = None if opt.no_test else data.test_dataloader()
+
+    print("#### Data ####")
+    for k, v in data.datasets.items():
+        print(f"{k:12s}  {v.__class__.__name__:40s}  {len(v):>7d}")
+
+    # ----- learning rate scaling ------------------------------------------------
+    bs, base_lr = cfg.data.params.batch_size, cfg.model.base_learning_rate
+    grad_acc    = getattr(cfg.trainer, "accumulate_grad_batches", 1)
+    num_gpus    = torch.cuda.device_count() or 1
     if opt.scale_lr:
-        model.learning_rate = accumulate_grad_batches * num_nodes * ngpu * bs * base_lr
-        print(f'Setting learning rate to {model.learning_rate:.2e} = {accumulate_grad_batches=} * {num_nodes=} * {ngpu=} * {bs} * {base_lr:.2e} (base_lr)')
+        model.learning_rate = grad_acc * num_gpus * bs * base_lr
     else:
         model.learning_rate = base_lr
-        print("++++ NOT USING LR SCALING ++++")
-        print(f"Setting learning rate to {model.learning_rate:.2e}")
+    print(f"learning_rate = {model.learning_rate:.2e}")
 
-    # run
-    trainer.fit(model, data)
-    trainer.test(model, data.test_dataloader)
+    # ----- optimiser & scheduler -----------------------------------------------
+    optimizer = AdamW(model.parameters(), lr=model.learning_rate, weight_decay=1e-2)
+
+    epochs          = getattr(cfg.trainer, "max_epochs", 1)
+    warmup_steps    = getattr(cfg.trainer, "warmup_steps", 0)
+    total_steps     = len(train_loader) * epochs // grad_acc
+    scheduler = get_cosine_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps = warmup_steps,
+        num_training_steps = total_steps,
+    )
+
+    # ----- accelerator ----------------------------------------------------------
+    ddp_kwargs  = DistributedDataParallelKwargs(find_unused_parameters=False)
+    ds_plugin   = DeepSpeedPlugin(zero_stage=2)
+    accelerator = Accelerator(
+        gradient_accumulation_steps = grad_acc,
+        mixed_precision             = "bf16" if torch.cuda.is_bf16_supported() else "fp16",
+        kwargs_handlers             = [ddp_kwargs],
+        deepspeed_plugin            = ds_plugin,
+    )
+
+    model, optimizer, train_loader, val_loader, scheduler = accelerator.prepare(
+        model, optimizer, train_loader, val_loader, scheduler
+    )
+
+    # ----- training loop --------------------------------------------------------
+    for epoch in range(epochs):
+        model.train()
+        for step, batch in enumerate(train_loader, 1):
+            with accelerator.accumulate(model):
+                outs = model(**batch)
+                loss = outs["loss"] if isinstance(outs, dict) else outs.loss
+                accelerator.backward(loss)
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            if accelerator.is_main_process and step % 50 == 0:
+                accelerator.print(f"epoch {epoch:02d} step {step:05d} loss {loss.item():.4f}")
+
+        # ----- validation -------------------------------------------------------
+        if val_loader is not None and accelerator.is_main_process:
+            model.eval()
+            val_loss = 0.0
+            with torch.no_grad():
+                for batch in val_loader:
+                    outs = model(**batch)
+                    val_loss += (outs["loss"] if isinstance(outs, dict) else outs.loss).item()
+            val_loss /= len(val_loader)
+            accelerator.print(f"epoch {epoch:02d} val_loss {val_loss:.4f}")
+            model.train()
+
+        # ----- checkpoint -------------------------------------------------------
+        if accelerator.is_main_process:
+            ckpt_path = os.path.join(ckptdir, f"epoch-{epoch:03d}.pt")
+            accelerator.save_state(ckpt_path)
+
+    # ----- test -----------------------------------------------------------------
+    if test_loader is not None:
+        model.eval()
+        with torch.no_grad():
+            for _batch in test_loader:
+                _ = model(**_batch)
+        accelerator.print("testing complete")
+
+
+# -------------------------------------------------------------------------
+# entry point
+# -------------------------------------------------------------------------
+if __name__ == "__main__":
+    main()
