@@ -118,221 +118,75 @@ def clip_bboxes(bboxes, height, width):
 #     y2 = xywh[1] + xywh[3] / 2
 #     return np_asarray([int(x1), int(y1), int(x2), int(y2)])
 
+def crop_square_from_mask(tgt: torch_Tensor, src: torch_Tensor, mask: torch_Tensor, pad_min: float = 0.10, pad_max: float = 0.40, gen: Optional[torch_Generator] = None):
+    'Return tgt, src, mask cropped to a random square around the masked area.'
+    nz = torch.nonzero(mask[0] > 0, as_tuple=False)
+    if nz.numel() == 0:
+        return tgt, src, mask
 
-class OpenImageDataset(Dataset):
-    def __init__(self,state,arbitrary_mask_percent=0,**args
-        ):
-        self.state=state
-        self.args=args
-        self.arbitrary_mask_percent=arbitrary_mask_percent
-        self.kernel = np.ones((1, 1), np.uint8)
-        self.random_trans=A.Compose([
-            A.Resize(height=224,width=224),
-            A.HorizontalFlip(p=0.5),
-            A.Rotate(limit=20),
-            A.Blur(p=0.3),
-            A.ElasticTransform(p=0.3)
+    y1x1 = nz.min(0).values
+    y2x2 = nz.max(0).values
+    y1, x1 = int(y1x1[0]), int(y1x1[1])
+    y2, x2 = int(y2x2[0]), int(y2x2[1])
+    obj_h, obj_w = y2 - y1, x2 - x1
+    rand = torch.rand(1, generator=gen).item()
+    side = int(max(obj_h, obj_w) * (1 + pad_min + (pad_max - pad_min) * rand))
+
+    _, H, W = tgt.shape
+    cy, cx = (y1 + y2) // 2, (x1 + x2) // 2
+    top = max(min(cy - side // 2, H - side), 0)
+    left = max(min(cx - side // 2, W - side), 0)
+
+    v_slice, h_slice = slice(top, top + side), slice(left, left + side)
+    return tgt[:, v_slice, h_slice], src[:, v_slice, h_slice], mask[:, v_slice, h_slice]
+
+# -----------------------------------------------------------------------------
+# dataset class ----------------------------------------------------------------
+
+class PBEQuadrupleDataset(Dataset):
+    'Dataset yielding (source, mask, reference, target) tuples for PBE.'
+
+    def __init__(self, csv_file: str | Path, image_size: int = 512, crop_to_square: bool = True, clip_aug: Optional[v2.Compose] = None):
+        self.df = pd.read_csv(csv_file)
+        self.crop = crop_to_square
+        self.to_img = _get_tensor()
+        self.to_mask = _get_tensor(normalise=False)
+        self.to_clip = _get_tensor_clip()
+        self.resize_img = Resize([image_size, image_size])
+        self.resize_mask = Resize([image_size, image_size])
+        self.clip_aug = clip_aug or v2.Compose([
+            v2.Resize((224, 224)),
+            v2.RandomHorizontalFlip(p=0.5),
+            v2.RandomRotation(degrees=20),
+            v2.RandomApply([v2.GaussianBlur(kernel_size=5)], p=0.3),
         ])
 
-        self.dataset_dir = dataset_dir = Path(args['dataset_dir'])
-        # if state == "train":
-        #     # bbox_path_list = []
-        #     # dir_name_list=['0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f']
-        #     # dir_name_list = ('0',)
-        #     # dir_name_list = ('mine',)
-        #     # for dir_name in dir_name_list:
-        #     bbox_dir=dataset_dir / 'bbox' / 'train'
-        #     # per_dir_file_list=
-        #     # for file_name in per_dir_file_list:
-        #     #     if file_name not in BAD_LIST:
-        #     #         bbox_path_list.append(os.path.join(bbox_dir,file_name))
-        #     bbox_path_list = [os.path.join(bbox_dir,file_name) for file_name in os.listdir(bbox_dir) if file_name not in BAD_LIST]
-        # # elif state == "validation":
-        # else:
-        bbox_dir = dataset_dir / 'bbox' / state
-        self.bbox_path_list = bbox_path_list = sorted(bbox_dir / file_name for file_name in os.listdir(bbox_dir) if file_name not in BAD_LIST)
-        # else:
-        #     bbox_dir = os.path.join(args['dataset_dir'],'bbox','test')
-        #     bbox_path_list = [os.path.join(bbox_dir,file_name) for file_name in os.listdir(bbox_dir) if file_name not in BAD_LIST]
-        # bbox_path_list.sort()
-        self.length = len(bbox_path_list)
-        # self.bbox_path_list = bbox_path_list
-        self.to_tensor_transform = get_tensor()
-        self.to_tensor_clip_transform = get_tensor_clip()
-        self.to_mask_tensor_transform = get_tensor(normalize=False)
-        image_size = args['image_size']
-        self.image_resize = Resize([image_size, image_size])
-        self.mask_resize = Resize([image_size, image_size])
-        # self.image_resize = Resize([image_size, image_size], interpolation=InterpolationMode.BILINEAR, antialias=True)
-        # self.mask_resize = Resize([image_size, image_size], interpolation=InterpolationMode.NEAREST)
-
-    def __getitem__(self, index):
-        bbox_path=self.bbox_path_list[index]
-        # file_name=os.path.splitext(os.path.basename(bbox_path))[0]+'.jpg'
-        file_name=f'{bbox_path.stem}.jpg'
-        # file_name=os.path.splitext(os.path.basename(bbox_path))[0]+'.png'
-        # breakpoint()
-        # dir_name=bbox_path.split('/')[-2]
-        bbox_path_parent = bbox_path.parent
-        img_path = bbox_path_parent.parent.parent / DIRNAME_AFTER / bbox_path_parent.name / file_name
-        # img_path=os.path.join(self.dataset_dir, DIRNAME_AFTER, dir_name, file_name)
-
-        bbox = x1, y1, x2, y2 = [int(num) for num in bbox_path.read_text().split()]
-        # with open(bbox_path) as f:
-        #     bbox_list = [
-        #         [int(float(coord)) for coord in line_stripped.split()]
-        #         # xywh_to_xyxy([int(float(coord)) for coord in line_stripped.split()])
-        #         for line in f if (line_stripped := line.strip())
-        #     ]
-        if not bbox or not len(bbox) == 4:
-            raise ValueError(f'{bbox_path=}, {file_name=}, {img_path=}')
-        # bbox = xywh_to_xyxy()
-
-        # bbox = x1, y1, x2, y2 = random_choice(bbox_list) # [1049, 116, 1075, 238]
-        img_p = Image_open(img_path).convert("RGB")
-        try:
-            img_p.verify()
-        except Exception as e:
-            raise ValueError(f'{img_path=} is corrupted') from e
-        W, H = img_p.size # (1024, 670)
-        # print(f'Before clipping: {bbox=}, {H=}, {W=}, {img_path=}, {basename(bbox_path)=}') # bbox = [1049, 116, 1075, 238]
-        bbox = x1, y1, x2, y2 = clip_bboxes(bbox, H, W) # (np.int64(1049), np.int64(116), np.int64(1024), np.int64(238))
-        # print(f'After clipping: {bbox=}, {H=}, {W=}, {img_path=}, {basename(bbox_path)=}') # bbox = [1049, 116, 1075, 238]
-
-        ### Get reference image
-        bbox_pad_0 = x1 - min(10, x1)
-        bbox_pad_1 = y1 - min(10, y1)
-        bbox_pad_2 = x2 + min(10, W-x2)
-        bbox_pad_3 = y2 + min(10, H-y2)
-        bbox_pad_0, bbox_pad_1, bbox_pad_2, bbox_pad_3 = clip_bboxes([bbox_pad_0, bbox_pad_1, bbox_pad_2, bbox_pad_3], H, W)
-        # img_p_np = cv2.imread(img_path)
-        # img_p_np = cv2.cvtColor(img_p_np, cv2.COLOR_BGR2RGB)
-        img_p_np = np_asarray(img_p)
-        ref_image_tensor = img_p_np[bbox_pad_1:bbox_pad_3, bbox_pad_0:bbox_pad_2, :]
-        assert ref_image_tensor.size > 0, f"Array should not be empty. {img_p_np.shape=}; img_p_np[{bbox_pad_1=}:{bbox_pad_3=}, {bbox_pad_0=}:{bbox_pad_2=}, :], {img_path=}, {bbox=},\n\n{basename(bbox_path)=}"
-        # try:
-        # except Exception as e:
-        #     print(e)
-        #     # breakpoint()
-            # return basename(bbox_path)
-        ref_image_tensor = self.random_trans(image=ref_image_tensor)
-        ref_image_tensor = Image_fromarray(ref_image_tensor["image"])
-        ref_image_tensor = self.to_tensor_clip_transform(ref_image_tensor)
-
-        ### Generate mask
-        image_tensor = self.to_tensor_transform(img_p)
-        # if W == 0 or H == 0:
-        #     raise ValueError(f'{img_path=} is empty')
-
-        # extended_bbox=copy(bbox)
-        left_freespace=x1
-        up_freespace=y1
-        right_freespace=W-x2
-        down_freespace=H-y2
-        assert left_freespace >= 0, f'{left_freespace=} <= 0, {bbox_path=}, {img_path=}, {bbox=}, {img_p.size=}, \n\n{basename(bbox_path)=}\n'
-        assert up_freespace >= 0, f'{up_freespace=} <= 0, {bbox_path=}, {img_path=}, {bbox=}, \n\n{basename(bbox_path)=}\n'
-        assert right_freespace >= 0, f'{right_freespace=}=({W=}-{x2=}) <= 0, {bbox_path=}, {img_path=}, {bbox=}, {img_p.size=}, \n\n{basename(bbox_path)=}\n'
-        assert down_freespace >= 0, f'{down_freespace=}=({H=}-{y2=}) <= 0, {bbox_path=}, {img_path=}, {bbox=}, {img_p.size=}, \n\n{basename(bbox_path)=}\n'
-        # try:
-        # except Exception as e:
-        #     print(e)
-        #     # breakpoint()
-        #     return basename(bbox_path)
-        # extended_bbox[0] = x1 - random_randint(0,int(0.4*left_freespace))
-        # extended_bbox[1] = y1 - random_randint(0,int(0.4*up_freespace))
-        # extended_bbox[2] = x2 + random_randint(0,int(0.4*right_freespace))
-        # extended_bbox[3] = y2 + random_randint(0,int(0.4*down_freespace))
-        extended_bbox = (
-            x1 - random_randint(0, int(0.4*left_freespace)),
-            y1 - random_randint(0, int(0.4*up_freespace)),
-            x2 + random_randint(0, int(0.4*right_freespace)),
-            y2 + random_randint(0, int(0.4*down_freespace)),
-        )
-
-        prob = random_uniform(0, 1)
-        if prob < self.arbitrary_mask_percent:
-            mask_img = Image_new('RGB', (W, H), (255, 255, 255))
-            x1_x2_mid = (x1+x2)/2
-            extended_bbox_mask=copy(extended_bbox)
-            top_nodes = np_asfortranarray([
-                            [x1, x1_x2_mid , x2],
-                            [y1, extended_bbox_mask[1], y1],
-                        ])
-            down_nodes = np_asfortranarray([
-                    [x2, x1_x2_mid , x1],
-                    [y2, extended_bbox_mask[3], y2],
-                ])
-            left_nodes = np_asfortranarray([
-                    [x1,extended_bbox_mask[0] , x1],
-                    [y2, (y1+y2)/2, y1],
-                ])
-            right_nodes = np_asfortranarray([
-                    [x2,extended_bbox_mask[2] , x2],
-                    [y1, (y1+y2)/2, y2],
-                ])
-            top_curve = Curve(top_nodes,degree=2)
-            right_curve = Curve(right_nodes,degree=2)
-            down_curve = Curve(down_nodes,degree=2)
-            left_curve = Curve(left_nodes,degree=2)
-            pt_list=[]
-            random_width=5
-            for curve in (top_curve,right_curve,down_curve,left_curve):
-                x_list=[]
-                y_list=[]
-                for i in range(1,19):
-                    evaluation = curve.evaluate(i*0.05)
-                    if (evaluation_0_0 := evaluation[0][0]) not in x_list and (evaluation_1_0 := evaluation[1][0]) not in y_list:
-                        pt_list.append((evaluation_0_0 + random_randint(-random_width,random_width),evaluation_1_0 + random_randint(-random_width,random_width)))
-                        x_list.append(evaluation_0_0)
-                        y_list.append(evaluation_1_0)
-            mask_img_draw=Draw(mask_img)
-            mask_img_draw.polygon(pt_list,fill=(0,0,0))
-            mask_tensor=self.to_mask_tensor_transform(mask_img)[0].unsqueeze(0)
-        else:
-            mask_img=np.zeros((H,W))
-            mask_img[extended_bbox[1]:extended_bbox[3],extended_bbox[0]:extended_bbox[2]]=1
-            mask_img=Image_fromarray(mask_img)
-            mask_tensor=1-self.to_mask_tensor_transform(mask_img)
-
-        ### Crop square image
-        if W > H:
-            left_most=extended_bbox[2]-H
-            left_most = max(left_most, 0)
-            right_most=extended_bbox[0]+H
-            right_most = min(right_most, W)
-            right_most=right_most-H
-            if right_most<= left_most:
-                image_tensor_cropped=image_tensor
-                mask_tensor_cropped=mask_tensor
-            else:
-                left_pos = random_randint(left_most,right_most)
-                free_space=min(extended_bbox[1],extended_bbox[0]-left_pos,left_pos+H-extended_bbox[2],H-extended_bbox[3])
-                random_free_space = random_randint(0,int(0.6*free_space))
-                image_tensor_cropped=image_tensor[:,0+random_free_space:H-random_free_space,left_pos+random_free_space:left_pos+H-random_free_space]
-                mask_tensor_cropped=mask_tensor[:,0+random_free_space:H-random_free_space,left_pos+random_free_space:left_pos+H-random_free_space]
-        elif W < H:
-            upper_most=extended_bbox[3]-W
-            upper_most = max(upper_most, 0)
-            lower_most=extended_bbox[1]+W
-            lower_most = min(lower_most, H) - W
-            if lower_most<=upper_most:
-                image_tensor_cropped=image_tensor
-                mask_tensor_cropped=mask_tensor
-            else:
-                upper_pos = random_randint(upper_most,lower_most)
-                free_space=min(extended_bbox[1]-upper_pos,extended_bbox[0],W-extended_bbox[2],upper_pos+W-extended_bbox[3])
-                random_free_space = random_randint(0,int(0.6*free_space))
-                image_tensor_cropped=image_tensor[:,upper_pos+random_free_space:upper_pos+W-random_free_space,random_free_space:W-random_free_space]
-                mask_tensor_cropped=mask_tensor[:,upper_pos+random_free_space:upper_pos+W-random_free_space,random_free_space:W-random_free_space]
-        else:
-            image_tensor_cropped=image_tensor
-            mask_tensor_cropped=mask_tensor
-
-        image_tensor_resize=self.image_resize(image_tensor_cropped)
-        mask_tensor_resize=self.mask_resize(mask_tensor_cropped)
-        inpaint_tensor_resize=image_tensor_resize*mask_tensor_resize
-        # breakpoint()
-        return {"GT":image_tensor_resize,"inpaint_image":inpaint_tensor_resize,"inpaint_mask":mask_tensor_resize,"ref_imgs":ref_image_tensor}
-
     def __len__(self):
-        return self.length
+        return len(self.df)
+
+    @staticmethod
+    def _pil_rgb(path: str | Path):
+        return Image_open(path).convert('RGB')
+
+    @staticmethod
+    def _pil_mask(path: str | Path):
+        return Image_open(path).convert('L')
+
+    def __getitem__(self, idx: int):
+        row = self.df.iloc[idx]
+        tgt = self.to_img(self._pil_rgb(row['tgt']))
+        src = self.to_img(self._pil_rgb(row['src']))
+        mask = self.to_mask(self._pil_mask(row['mask']))
+        src = src * mask
+
+        if self.crop:
+            tgt, src, mask = crop_square_from_mask(tgt, src, mask)
+
+        tgt = self.resize_img(tgt)
+        mask = (self.resize_mask(mask) > 0.5).float()
+        src = self.resize_img(src)
+
+        ref_pil = self.clip_aug(self._pil_rgb(row['ref']))
+        ref = self.to_clip(ref_pil)
+
+        return {'inpaint_image': src, 'inpaint_mask': mask, 'ref_imgs': ref, 'GT': tgt}
