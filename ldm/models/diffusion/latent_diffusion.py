@@ -55,7 +55,7 @@ from ldm.models.diffusion.ddim import DDIMSampler
 # from ldm.util import exists, default, count_params, instantiate_from_config
 
 DDIM_STEPS_LOGGING = 50
-
+USE_LOGGER_PL = True
 
 
 COLUMNS = ['split', 'global_step', 's3path_image_before', 'image_before_masked', 'image_cirep', 'image_after_gt', 'image_after_pred']
@@ -139,10 +139,10 @@ class LatentDiffusion(DDPM):
             self.init_from_ckpt(ckpt_path, ignore_keys)
             self.restarted_from_ckpt = True
 
-        with torch_no_grad():
-            # self.fid = FrechetInceptionDistance(feature=64, normalize=True).eval().to(self.device, non_blocking=True)
-            # self.fid = FrechetInceptionDistance(feature=64, normalize=True).eval().to(self.device, non_blocking=True)
-            self.fid = FrechetInceptionDistance(sync_on_compute=False)
+        # with torch_no_grad():
+        #     # self.fid = FrechetInceptionDistance(feature=64, normalize=True).eval().to(self.device, non_blocking=True)
+        #     # self.fid = FrechetInceptionDistance(feature=64, normalize=True).eval().to(self.device, non_blocking=True)
+        #     self.fid = FrechetInceptionDistance(sync_on_compute=False).requires_grad_(False)
         # self.fid = fid
         # self.wandb_image_logger = wandb_image_logger = WandbImageLogger()
         # self.log_image_pair = wandb_image_logger.log_image_pair
@@ -623,10 +623,6 @@ class LatentDiffusion(DDPM):
         return loss
 
     def forward(self, x, c, *args, **kwargs):
-        # x: torch.Size([4, 9, 64, 64])
-        # c: torch.Size([4, 3, 224, 224])
-        # breakpoint()
-
         t = torch_randint(0, self.num_timesteps, (x.size(0),), device=self.device, dtype=torch_int64)
         # self.u_cond_prop=random(0, 1)
         self.u_cond_prop=random()
@@ -1215,22 +1211,68 @@ class LatentDiffusion(DDPM):
 
             # logger_experiment_log(grid_items)
             # logger_experiment_log({f'{split}/inpainting_results_grid': wandb_Image(results_grid)})
-            if x.size(0) > 1:
-                # with torch_inference_mode():
-                with torch_no_grad():
-                    fid = self.fid
-                    fid.reset()
-                    # fid.update(image_after_gt_unnorm.to('cpu', non_blocking=True), real=True)
-                    # fid.update(imgs_after_pred_unnorm.to('cpu', non_blocking=True), real=False)
-                    fid.update(image_after_gt_unnorm, real=True)
-                    fid.update(imgs_after_pred_unnorm, real=False)
-                    # breakpoint()
-                    fid_value = fid.compute() # NOTE: needs more than one samples. so x.size(1) > 1
+            # if x.size(0) > 1:
+            #     # with torch_inference_mode():
+            #     with torch_no_grad():
+            #         fid = self.fid
+            #         fid.reset()
+            #         # fid.update(image_after_gt_unnorm.to('cpu', non_blocking=True), real=True)
+            #         # fid.update(imgs_after_pred_unnorm.to('cpu', non_blocking=True), real=False)
+            #         fid.update(image_after_gt_unnorm, real=True)
+            #         fid.update(imgs_after_pred_unnorm, real=False)
+            #         # breakpoint()
+            #         fid_value = fid.compute() # NOTE: needs more than one samples. so x.size(1) > 1
 
-                logger_experiment_log({f'{split}/fid': fid_value}, step=global_step)
-            else:
-                warning(f'Skipping FID computation for {split=} as batch size is 1. FID requires at least two samples to compute a meaningful score.')
+            #     logger_experiment_log({f'{split}/fid': fid_value}, step=global_step)
+            # else:
+            #     warning(f'Skipping FID computation for {split=} as batch size is 1. FID requires at least two samples to compute a meaningful score.')
+        return {'imgs_after_pred_unnorm': imgs_after_pred_unnorm}
 
+    @torch_inference_mode()
+    def validation_step(self, batch, batch_idx) -> torch_Tensor:
+        _, loss_dict_no_ema, _ = self.shared_step(batch)
+        with self.ema_scope():
+            _, loss_dict_ema, _ = self.shared_step(batch)
+            loss_dict_ema = {key + '_ema': loss_dict_ema[key] for key in loss_dict_ema}
+        # self.log_dict(loss_dict_no_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
+        self.log_dict(loss_dict_no_ema | loss_dict_ema, prog_bar=True, logger=USE_LOGGER_PL, on_step=True, on_epoch=True)
+        # self.log_dict(loss_dict_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
+        # self.log_dict(loss_dict_ema, prog_bar=False, logger=USE_LOGGER_PL, on_step=False, on_epoch=True)
+        # if self.trainer.global_rank == 0:
+            # print(f'DDPM.validation_step: {self.trainer.global_rank == 0=}', 'log_images')
+        # global_step = self.global_step if hasattr(self, 'global_step') else self.trainer.global_step
+        # log_every_n_steps = self.log_every_n_steps if hasattr(self, 'log_every_n_steps') else self.trainer.log_every_n_steps
+        # if global_step % log_every_n_steps == 0 and rank_zero_only.rank == 0:
+        # if global_step % log_every_n_steps == 0:
+        images = self.log_images(batch, N=4, n_row=2, sample=True, split='val', ddim_steps=DDIM_STEPS_LOGGING) #, return_keys=['inputs', 'samples', 'diffusion_row'],)
+        return images
+
+    @torch_inference_mode()
+    def test_step(self, batch, _batch_idx):
+        _, loss_dict_no_ema = self.shared_step(batch)
+        with self.ema_scope():
+            _, loss_dict_ema = self.shared_step(batch)
+            # loss_dict_ema = {key + '_ema': loss_dict_ema[key] for key in loss_dict_ema}
+            loss_dict_ema = {f'{key}_ema': v for key, v in loss_dict_ema.items()}
+        # self.log_dict(loss_dict_no_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
+        self.log_dict(loss_dict_no_ema | loss_dict_ema, prog_bar=True, logger=USE_LOGGER_PL, on_step=True, on_epoch=True)
+        # self.log_dict(loss_dict_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
+        # self.log_dict(loss_dict_ema, prog_bar=False, logger=USE_LOGGER_PL, on_step=False, on_epoch=True)
+        # if self.trainer.global_rank == 0:
+            # print(f'DDPM.validation_step: {self.trainer.global_rank == 0=}', 'log_images')
+        # global_step = self.global_step if hasattr(self, 'global_step') else self.trainer.global_step
+        # log_every_n_steps = self.log_every_n_steps if hasattr(self, 'log_every_n_steps') else self.trainer.log_every_n_steps
+        # if global_step % log_every_n_steps == 0 and rank_zero_only.rank == 0:
+        # if global_step % log_every_n_steps == 0:
+        images = self.log_images(batch, N=4, n_row=2, sample=True, split='test', ddim_steps=DDIM_STEPS_LOGGING) #, return_keys=['inputs', 'samples', 'diffusion_row'],)
+        return images
+        # dict_images = self.log_images(batch, N=4, n_row=2, sample=True) #, return_keys=['inputs', 'samples', 'diffusion_row'],)
+        # self.log_dict(dict_images)
+        # self.log_images(batch, N=4, n_row=2, sample=True, split='test', ddim_steps=DDIM_STEPS_LOGGING) #, return_keys=['inputs', 'samples', 'diffusion_row'],)
+        # dict_images = self.log_images(batch, N=4, n_row=2, sample=True) #, return_keys=['inputs', 'samples', 'diffusion_row'],)
+        # self.log_dict(dict_images)
+        # dict_images = self.log_images(batch, N=4, n_row=2, sample=True) #, return_keys=['inputs', 'samples', 'diffusion_row'],)
+        # self.log_dict(dict_images)
         # Logging loop
         # log['inputs']: torch.Size([4, 3, 512, 512])
         # log['mask']: torch.Size([4, 1, 512, 512])
@@ -1460,7 +1502,7 @@ class LatentDiffusion(DDPM):
         #     breakpoint()
         #     params.remove(p)
 
-        opt = AdamW(params, lr=lr)
+        opt = AdamW(params, lr=lr, fused=True)
         if self.use_scheduler:
             assert 'target' in self.scheduler_config
             scheduler = instantiate_from_config(self.scheduler_config)
