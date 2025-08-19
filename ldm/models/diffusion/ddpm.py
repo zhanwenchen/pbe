@@ -352,7 +352,7 @@ class DDPM(LightningModule):
 
         return loss
 
-    def p_losses(self, x_start, t, noise=None):
+    def p_losses(self, x_start, t, noise=None) -> tuple[torch_Tensor, dict, torch_Tensor]:
         noise = default(noise, lambda: torch_randn_like(x_start))
         x_noisy = self.q_sample(x_start=x_start, t=t, noise=noise)
         model_out = self.model(x_noisy, t)
@@ -379,7 +379,7 @@ class DDPM(LightningModule):
 
         loss_dict.update({f'{log_prefix}/loss': loss.item()})
 
-        return loss, loss_dict
+        return loss, loss_dict, model_out
 
     def forward(self, x, *args, **kwargs):
         # b, c, h, w, device, img_size, = *x.shape, x.device, self.image_size
@@ -411,11 +411,12 @@ class DDPM(LightningModule):
 
     def shared_step(self, batch):
         x = self.get_input(batch, self.first_stage_key)
-        loss, loss_dict = self(x)
-        return loss, loss_dict
+        # loss, loss_dict = self(x)
+        return self(x)
+        # return loss, loss_dict
 
-    def training_step(self, batch, batch_idx):
-        loss, loss_dict = self.shared_step(batch)
+    def training_step(self, batch, batch_idx) -> tuple[torch_Tensor, torch_Tensor]:
+        loss, loss_dict, model_out = self.shared_step(batch)
 
         # self.log_dict(loss_dict, prog_bar=True, logger=True, on_step=True, on_epoch=True)
         self.log_dict(loss_dict, prog_bar=True, logger=USE_LOGGER_PL, on_step=True, on_epoch=True)
@@ -428,15 +429,15 @@ class DDPM(LightningModule):
             # self.log('lr_abs', lr, prog_bar=True, logger=True, on_step=True, on_epoch=False)
             self.log('lr_abs', lr, prog_bar=True, logger=USE_LOGGER_PL, on_step=True, on_epoch=False)
 
-        return loss
+        return loss, model_out
 
     # @rank_zero_only
     # @torch_no_grad()
     @torch_inference_mode()
     def validation_step(self, batch, batch_idx):
-        _, loss_dict_no_ema = self.shared_step(batch)
+        _, loss_dict_no_ema, model_out = self.shared_step(batch)
         with self.ema_scope():
-            _, loss_dict_ema = self.shared_step(batch)
+            _, loss_dict_ema, model_out = self.shared_step(batch)
             loss_dict_ema = {key + '_ema': loss_dict_ema[key] for key in loss_dict_ema}
         # self.log_dict(loss_dict_no_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
         self.log_dict(loss_dict_no_ema | loss_dict_ema, prog_bar=True, logger=USE_LOGGER_PL, on_step=True, on_epoch=True)
@@ -453,28 +454,28 @@ class DDPM(LightningModule):
         # self.log_dict(dict_images)
 
     # @rank_zero_only
-    @torch_no_grad()
-    def test_step(self, batch, batch_idx):
-        _, loss_dict_no_ema = self.shared_step(batch)
-        with self.ema_scope():
-            _, loss_dict_ema = self.shared_step(batch)
-            loss_dict_ema = {key + '_ema': loss_dict_ema[key] for key in loss_dict_ema}
-        # self.log_dict(loss_dict_no_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
-        self.log_dict(loss_dict_no_ema | loss_dict_ema, prog_bar=True, logger=USE_LOGGER_PL, on_step=True, on_epoch=True)
-        # self.log_dict(loss_dict_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
-        # self.log_dict(loss_dict_ema, prog_bar=False, logger=USE_LOGGER_PL, on_step=False, on_epoch=True)
-        # if self.trainer.global_rank == 0:
-            # print(f'DDPM.validation_step: {self.trainer.global_rank == 0=}', 'log_images')
-        global_step = self.global_step if hasattr(self, 'global_step') else self.trainer.global_step
-        log_every_n_steps = self.log_every_n_steps if hasattr(self, 'log_every_n_steps') else self.trainer.log_every_n_steps
-        # if global_step % log_every_n_steps == 0 and rank_zero_only.rank == 0:
-        if global_step % log_every_n_steps == 0:
-            self.log_images(batch, N=4, n_row=2, sample=True, split='test', ddim_steps=DDIM_STEPS_LOGGING) #, return_keys=['inputs', 'samples', 'diffusion_row'],)
-        # dict_images = self.log_images(batch, N=4, n_row=2, sample=True) #, return_keys=['inputs', 'samples', 'diffusion_row'],)
-        # self.log_dict(dict_images)
-        # self.log_images(batch, N=4, n_row=2, sample=True, split='test', ddim_steps=DDIM_STEPS_LOGGING) #, return_keys=['inputs', 'samples', 'diffusion_row'],)
-        # dict_images = self.log_images(batch, N=4, n_row=2, sample=True) #, return_keys=['inputs', 'samples', 'diffusion_row'],)
-        # self.log_dict(dict_images)
+    # @torch_no_grad()
+    # def test_step(self, batch, batch_idx):
+    #     _, loss_dict_no_ema = self.shared_step(batch)
+    #     with self.ema_scope():
+    #         _, loss_dict_ema = self.shared_step(batch)
+    #         loss_dict_ema = {key + '_ema': loss_dict_ema[key] for key in loss_dict_ema}
+    #     # self.log_dict(loss_dict_no_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
+    #     self.log_dict(loss_dict_no_ema | loss_dict_ema, prog_bar=True, logger=USE_LOGGER_PL, on_step=True, on_epoch=True)
+    #     # self.log_dict(loss_dict_ema, prog_bar=False, logger=True, on_step=False, on_epoch=True)
+    #     # self.log_dict(loss_dict_ema, prog_bar=False, logger=USE_LOGGER_PL, on_step=False, on_epoch=True)
+    #     # if self.trainer.global_rank == 0:
+    #         # print(f'DDPM.validation_step: {self.trainer.global_rank == 0=}', 'log_images')
+    #     global_step = self.global_step if hasattr(self, 'global_step') else self.trainer.global_step
+    #     log_every_n_steps = self.log_every_n_steps if hasattr(self, 'log_every_n_steps') else self.trainer.log_every_n_steps
+    #     # if global_step % log_every_n_steps == 0 and rank_zero_only.rank == 0:
+    #     if global_step % log_every_n_steps == 0:
+    #         self.log_images(batch, N=4, n_row=2, sample=True, split='test', ddim_steps=DDIM_STEPS_LOGGING) #, return_keys=['inputs', 'samples', 'diffusion_row'],)
+    #     # dict_images = self.log_images(batch, N=4, n_row=2, sample=True) #, return_keys=['inputs', 'samples', 'diffusion_row'],)
+    #     # self.log_dict(dict_images)
+    #     # self.log_images(batch, N=4, n_row=2, sample=True, split='test', ddim_steps=DDIM_STEPS_LOGGING) #, return_keys=['inputs', 'samples', 'diffusion_row'],)
+    #     # dict_images = self.log_images(batch, N=4, n_row=2, sample=True) #, return_keys=['inputs', 'samples', 'diffusion_row'],)
+    #     # self.log_dict(dict_images)
 
     def on_train_batch_end(self, *args, **kwargs):
         if self.use_ema:
@@ -540,7 +541,7 @@ class DDPM(LightningModule):
         params = list(self.model.parameters())
         if self.learn_logvar:
             params.append(self.logvar)
-        return AdamW(params, lr=lr)
+        return AdamW(params, lr=lr, fused=True)
 
 
 # class LatentDiffusion(DDPM):
