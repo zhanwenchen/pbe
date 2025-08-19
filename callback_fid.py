@@ -1,3 +1,4 @@
+from pathlib import Path
 from lightning.pytorch.callbacks import Callback
 from torch import Tensor as torch_Tensor, inference_mode as torch_inference_mode, device as torch_device
 from torchmetrics.image.fid import FrechetInceptionDistance
@@ -13,8 +14,10 @@ from torchmetrics.image.fid import FrechetInceptionDistance
 from torchvision.transforms.v2 import Transform
 from torchvision.transforms.v2.functional import to_dtype
 from torchvision.io import decode_image
+from pandas import DataFrame
 from PIL.Image import Image
 from torchvision.ops import masks_to_boxes, roi_align   # NEW (top of file)
+from r4_run_inference_batch import visualize_batch
 
 
 def _bbox_from_mask(mask: torch_Tensor) -> torch_Tensor:
@@ -84,39 +87,20 @@ class FIDCallback(Callback):
         feature: Inception feature dim (2048 typical).
         prefix: metric name prefix.
     """
-    def __init__(self, batch_real_key: str = "images_after_gt", outputs_fake_key: str = "imgs_after_pred_unnorm", feature: int = 2048, prefix: str = "fid"):
+    def __init__(self, split_fnames: dict[str, DataFrame] = None, result_path: Path = None, batch_real_key: str = "images_after_gt", outputs_fake_key: str = "imgs_after_pred_unnorm", feature: int = 2048, prefix: str = "fid"):
         super().__init__()
         self.batch_real_key = batch_real_key
         self.outputs_fake_key = outputs_fake_key
         self.prefix = prefix
         self.feature = feature
         # normalize=True ensures inputs in [0,255] get rescaled to [0,1]
+        self.split_fnames = split_fnames
+        self.result_path = result_path
+        self.filenames_test = split_fnames['test']['pair_name']
         with torch_inference_mode():
             self.fid_test_global = FrechetInceptionDistance(feature=feature, normalize=True, sync_on_compute=False).eval().requires_grad_(False)
             self.fid_test_local = FrechetInceptionDistance(feature=feature, normalize=True, sync_on_compute=False).eval().requires_grad_(False)
             self.fid_test_ref = FrechetInceptionDistance(feature=feature, normalize=True, sync_on_compute=False).eval().requires_grad_(False)
-        # self.fid_epoch = {
-        #     "train": FrechetInceptionDistance(feature=feature, normalize=True, sync_on_compute=False).requires_grad_(False),
-        #     "val":   FrechetInceptionDistance(feature=feature, normalize=True, sync_on_compute=False).requires_grad_(False),
-        #     "test":  FrechetInceptionDistance(feature=feature, normalize=True, sync_on_compute=False).requires_grad_(False),
-        # }
-        # self.fid_full = {
-        #     "train": FrechetInceptionDistance(feature=feature, normalize=True, sync_on_compute=False).requires_grad_(False),
-        #     "val":   FrechetInceptionDistance(feature=feature, normalize=True, sync_on_compute=False).requires_grad_(False),
-        #     "test":  FrechetInceptionDistance(feature=feature, normalize=True, sync_on_compute=False).requires_grad_(False),
-        # }
-
-    # --- utils ---
-    # def _move_all_to(self, device: torch.device) -> None:
-    #     for stage in ("train", "val", "test"):
-    #         self.fid_epoch[stage] = self.fid_epoch[stage].to(device)
-    #         self.fid_full[stage]  = self.fid_full[stage].to(device)
-
-    # def _update_stage(self, stage: str, real: torch.Tensor, fake: torch.Tensor) -> None:
-    #     self.fid_epoch[stage].update(real, real=True)
-    #     self.fid_epoch[stage].update(fake, real=False)
-    #     self.fid_full[stage].update(real, real=True);
-    #     self.fid_full[stage].update(fake, real=False)
 
     # --- device / resets ---
     def on_fit_start(self, trainer, pl_module) -> None:
@@ -137,11 +121,10 @@ class FIDCallback(Callback):
     def on_train_epoch_end(self, trainer, pl_module):
         pl_module.log(f"{self.prefix}/train", self.fid_train.compute(), prog_bar=True, sync_dist=True)
 
-    # def on_fit_end(self, trainer, pl_module):
-    #     pl_module.log(f"{self.prefix}/train_full_run", self.fid_train.compute(), sync_dist=True)
-
     # --- val ---
     def on_validation_epoch_start(self, trainer, pl_module):
+        device = pl_module.device
+        self.fid_test_global.to(device, non_blocking=True).reset()
         fid_test = self.fid_test.to(pl_module.device, non_blocking=True)
         # self.fid_epoch["val"].reset()
         fid_test.reset()
@@ -159,7 +142,6 @@ class FIDCallback(Callback):
     # --- test ---
 
     def on_test_epoch_start(self, _trainer, pl_module) -> None:
-        # print('on_test_epoch_start')
         device = pl_module.device
         self.fid_test_global.to(device, non_blocking=True).reset()
         self.fid_test_local.to(device, non_blocking=True).reset()
@@ -171,10 +153,14 @@ class FIDCallback(Callback):
     #     fid_test.reset()
         # self.fid_batch['test'].reset()
 
-    def on_test_batch_end(self, trainer, pl_module, outputs: dict[str, torch_Tensor], batch, batch_idx, dataloader_idx=0):
+    def on_test_batch_end(self, trainer, pl_module, outputs: dict[str, torch_Tensor], batch, _batch_idx, _dataloader_idx=0):
         # print('on_test_batch_end')
         # breakpoint()
         device = pl_module.device
+
+        images_mask = batch['images_mask'].to(device, non_blocking=True)
+        images_ref = batch['images_ref'].to(device, non_blocking=True)
+        index = batch['index'].to('cpu', non_blocking=True).numpy()
 
         # 1. Global FIDs
         images_after_gt_global = batch[self.batch_real_key].to(device, non_blocking=True)
@@ -183,27 +169,29 @@ class FIDCallback(Callback):
         self.fid_test_global.update(images_after_pred_global, real=False)
 
         # 2. Local FIDs
-        images_mask = batch['images_mask'].to(device, non_blocking=True)
         images_after_gt_local = _roi_crop_and_resize(images_after_gt_global, images_mask)
         images_after_pred_local = _roi_crop_and_resize(images_after_pred_global, images_mask)   # uint8
+        assert len(images_after_gt_global) == len(images_after_pred_global) == len(images_mask) == len(images_ref), f'Batch size mismatch: {len(images_after_gt_global)=}, {len(images_after_pred_local)=}, {len(images_mask)=}, {len(images_ref)=}'
         self.fid_test_local.update(images_after_gt_local, real=True)
         self.fid_test_local.update(images_after_pred_local, real=False)
 
         # 3. Reference vs Local FIDs
-        images_ref = batch['images_ref'].to(device, non_blocking=True)
-        breakpoint()
         self.fid_test_ref.update(images_ref, real=True)
         self.fid_test_ref.update(images_after_pred_local, real=False)
+        _images_grid = visualize_batch(batch, images_after_pred_global, self.result_path, self.filenames_test[index], do_save=True)
 
-    def on_test_epoch_end(self, trainer, pl_module):
+
+    def on_test_epoch_end(self, _trainer, pl_module):
         # print('on_test_epoch_end')
         # pl_module.log('test/fid', self.fid_test.compute(), prog_bar=True, sync_dist=True)
-        pl_module.log({
-            'test/fid_global', self.fid_test_global.compute(),
-            'test/fid_local', self.fid_test_local.compute(),
-            'test/fid_ref', self.fid_test_ref.compute(),
+        pl_module.log_dict({
+            'test/fid_global': float(self.fid_test_global.compute()),
+            'test/fid_local': float(self.fid_test_local.compute()),
+            'test/fid_ref': float(self.fid_test_ref.compute()),
         }, prog_bar=True, sync_dist=True)
-        self.fid_test.to('cpu', non_blocking=True)
+        self.fid_test_global.to('cpu', non_blocking=True).reset()
+        self.fid_test_local.to('cpu', non_blocking=True).reset()
+        self.fid_test_ref.to('cpu', non_blocking=True).reset()
 
     # def on_test_end(self, trainer, pl_module):
     #     print('on_test_end')
