@@ -1,14 +1,14 @@
 """SAMPLING ONLY."""
 
 import torch
+from torch import inference_mode, full as torch_full, int64 as torch_int64, cat as torch_cat, Tensor, float32 as torch_float32
+from torch.nn.functional import dropout
 import numpy as np
-from tqdm import tqdm
-from functools import partial
-
+# from tqdm import tqdm
 from ldm.modules.diffusionmodules.util import make_ddim_sampling_parameters, make_ddim_timesteps, noise_like
 
 
-class PLMSSampler(object):
+class PLMSSampler:
     def __init__(self, model, schedule="linear", **kwargs):
         super().__init__()
         self.model = model
@@ -16,7 +16,7 @@ class PLMSSampler(object):
         self.schedule = schedule
 
     def register_buffer(self, name, attr):
-        if type(attr) == torch.Tensor:
+        if isinstance(attr, Tensor):
             if attr.device != torch.device("cuda"):
                 attr = attr.to(torch.device("cuda"))
         setattr(self, name, attr)
@@ -28,7 +28,7 @@ class PLMSSampler(object):
                                                   num_ddpm_timesteps=self.ddpm_num_timesteps,verbose=verbose)
         alphas_cumprod = self.model.alphas_cumprod
         assert alphas_cumprod.shape[0] == self.ddpm_num_timesteps, 'alphas have to be defined for each timestep'
-        to_torch = lambda x: x.clone().detach().to(torch.float32).to(self.model.device)
+        to_torch = lambda x: x.clone().detach().to(self.model.device, torch_float32, non_blocking=True)
 
         self.register_buffer('betas', to_torch(self.model.betas))
         self.register_buffer('alphas_cumprod', to_torch(alphas_cumprod))
@@ -54,7 +54,8 @@ class PLMSSampler(object):
                         1 - self.alphas_cumprod / self.alphas_cumprod_prev))
         self.register_buffer('ddim_sigmas_for_original_num_steps', sigmas_for_original_sampling_steps)
 
-    @torch.no_grad()
+    # @torch.no_grad()
+    @inference_mode()
     def sample(self,
                S,
                batch_size,
@@ -92,7 +93,7 @@ class PLMSSampler(object):
         # sampling
         C, H, W = shape
         size = (batch_size, C, H, W)
-        print(f'Data shape for PLMS sampling is {size}')
+        # print(f'Data shape for PLMS sampling is {size}')
 
         samples, intermediates = self.plms_sampling(conditioning, size,
                                                     callback=callback,
@@ -112,7 +113,8 @@ class PLMSSampler(object):
                                                     )
         return samples, intermediates
 
-    @torch.no_grad()
+    # @torch.no_grad()
+    @inference_mode()
     def plms_sampling(self, cond, shape,
                       x_T=None, ddim_use_original_steps=False,
                       callback=None, timesteps=None, quantize_denoised=False,
@@ -135,20 +137,20 @@ class PLMSSampler(object):
         intermediates = {'x_inter': [img], 'pred_x0': [img]}
         time_range = list(reversed(range(0,timesteps))) if ddim_use_original_steps else np.flip(timesteps)
         total_steps = timesteps if ddim_use_original_steps else timesteps.shape[0]
-        print(f"Running PLMS Sampling with {total_steps} timesteps")
+        # print(f"Running PLMS Sampling with {total_steps} timesteps")
 
-        iterator = tqdm(time_range, desc='PLMS Sampler', total=total_steps)
+        # iterator = tqdm(time_range, desc='PLMS Sampler', total=total_steps, disabled=True)
         old_eps = []
 
-        for i, step in enumerate(iterator):
+        for i, step in enumerate(time_range):
             index = total_steps - i - 1
-            ts = torch.full((b,), step, device=device, dtype=torch.long)
-            ts_next = torch.full((b,), time_range[min(i + 1, len(time_range) - 1)], device=device, dtype=torch.long)
+            ts = torch_full((b,), step, device=device, dtype=torch_int64)
+            ts_next = torch_full((b,), time_range[min(i + 1, len(time_range) - 1)], device=device, dtype=torch_int64)
 
             if mask is not None:
                 assert x0 is not None
                 img_orig = self.model.q_sample(x0, ts)  # TODO: deterministic forward pass?
-                img = img_orig * mask + (1. - mask) * img
+                img = img_orig * mask + (1 - mask) * img
 
             outs = self.p_sample_plms(img, cond, ts, index=index, use_original_steps=ddim_use_original_steps,
                                       quantize_denoised=quantize_denoised, temperature=temperature,
@@ -170,7 +172,8 @@ class PLMSSampler(object):
 
         return img, intermediates
 
-    @torch.no_grad()
+    # @torch.no_grad()
+    @inference_mode()
     def p_sample_plms(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None, old_eps=None, t_next=None,**kwargs):
@@ -179,9 +182,9 @@ class PLMSSampler(object):
             if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
                 e_t = self.model.apply_model(x, t, c)
             else:
-                x_in = torch.cat([x] * 2)
-                t_in = torch.cat([t] * 2)
-                c_in = torch.cat([unconditional_conditioning, c])
+                x_in = torch_cat([x] * 2)
+                t_in = torch_cat([t] * 2)
+                c_in = torch_cat((unconditional_conditioning, c))
                 e_t_uncond, e_t = self.model.apply_model(x_in, t_in, c_in).chunk(2)
                 e_t = e_t_uncond + unconditional_guidance_scale * (e_t - e_t_uncond)
 
@@ -198,10 +201,10 @@ class PLMSSampler(object):
 
         def get_x_prev_and_pred_x0(e_t, index):
             # select parameters corresponding to the currently considered timestep
-            a_t = torch.full((b, 1, 1, 1), alphas[index], device=device)
-            a_prev = torch.full((b, 1, 1, 1), alphas_prev[index], device=device)
-            sigma_t = torch.full((b, 1, 1, 1), sigmas[index], device=device)
-            sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index],device=device)
+            a_t = torch_full((b, 1, 1, 1), alphas[index], device=device)
+            a_prev = torch_full((b, 1, 1, 1), alphas_prev[index], device=device)
+            sigma_t = torch_full((b, 1, 1, 1), sigmas[index], device=device)
+            sqrt_one_minus_at = torch_full((b, 1, 1, 1), sqrt_one_minus_alphas[index], device=device)
 
             # current prediction for x_0
             pred_x0 = (x - sqrt_one_minus_at * e_t) / a_t.sqrt()
@@ -211,16 +214,23 @@ class PLMSSampler(object):
             dir_xt = (1. - a_prev - sigma_t**2).sqrt() * e_t
             noise = sigma_t * noise_like(x.shape, device, repeat_noise) * temperature
             if noise_dropout > 0.:
-                noise = torch.nn.functional.dropout(noise, p=noise_dropout)
+                noise = dropout(noise, p=noise_dropout)
             x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
             return x_prev, pred_x0
-        kwargs=kwargs['test_model_kwargs']
-        x_new=torch.cat([x,kwargs['inpaint_image'],kwargs['inpaint_mask']],dim=1)
+        test_model_kwargs = kwargs['test_model_kwargs']
+        inpaint_image = test_model_kwargs['images_inpaint']
+        inpaint_mask = test_model_kwargs['images_mask']
+        try:
+            # print(f'torch_cat: x.shape={x.shape}, inpaint_image.shape={inpaint_image.shape}, inpaint_mask.shape={inpaint_mask.shape}')
+            x_new = torch_cat((x, inpaint_image, inpaint_mask), dim=1)
+        except:
+            print(f'error in torch_cat: x.shape={x.shape}, inpaint_image.shape={inpaint_image.shape}, inpaint_mask.shape={inpaint_mask.shape}')
+            breakpoint()
         e_t = get_model_output(x_new, t)
         if len(old_eps) == 0:
             # Pseudo Improved Euler (2nd order)
             x_prev, pred_x0 = get_x_prev_and_pred_x0(e_t, index)
-            x_prev_new=torch.cat([x_prev,kwargs['inpaint_image'],kwargs['inpaint_mask']],dim=1)
+            x_prev_new = torch_cat((x_prev, inpaint_image, inpaint_mask), dim=1)
             e_t_next = get_model_output(x_prev_new, t_next)
             e_t_prime = (e_t + e_t_next) / 2
         elif len(old_eps) == 1:
